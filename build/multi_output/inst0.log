@@ -1,0 +1,25 @@
+
+╔══════════════════════════════════════════════════════════════╗
+║  BMT Offline Phase (Multi-Channel Parallel)                  ║
+╠══════════════════════════════════════════════════════════════╣
+║  Bit width:                 64                               ║
+║  Channels:                   2                               ║
+║  Triples:              2500000                               ║
+║  Start index:                0                               ║
+║  OT/triple:                 64                               ║
+║  Speedup factor:           1.0x (bits) × 2 (channels)       ║
+║  MPI threading:       MULTIPLE                               ║
+╚══════════════════════════════════════════════════════════════╝
+
+[Party 0] Handshake OK
+[Party 1] Handshake OK
+[Party 0] Using 2 channels, ~1250000 triples/channel
+[Party 1] Using 2 channels, ~1250000 triples/channel
+[Party 0] 500000/2500000 (20.0%), 16.5 K/s    [Party 1] 500000/2500000 (20.0%), 16.5 K/s    [Party 0] 1500000/2500000 (60.0%), 24.8 K/s    [Party 1] 1500000/2500000 (60.0%), 24.8 K/s    [Party 0] 2250000/2500000 (90.0%), 30.0 K/s    [Party 1] 2250000/2500000 (90.0%), 29.9 K/s    
+[Party 1] Done: 79.23 s, 31.55 K/s
+[Party 1] Channels: 2, OT calls: 360, Total OTs: 320000000
+[Party 1] Time breakdown: ChaCha=0.71s, Gilboa=152.41s, File=1.16s
+
+[Party 0] Done: 79.28 s, 31.53 K/s
+[Party 0] Channels: 2, OT calls: 360, Total OTs: 320000000
+[Party 0] Time breakdown: ChaCha=0.76s, Gilboa=152.33s, File=1.22s

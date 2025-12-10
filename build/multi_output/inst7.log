@@ -1,0 +1,42 @@
+--------------------------------------------------------------------------
+As of version 3.0.0, the "sm" BTL is no longer available in Open MPI.
+
+Efficient, high-speed same-node shared memory communication support in
+Open MPI is available in the "vader" BTL.  To use the vader BTL, you
+can re-run your job with:
+
+    mpirun --mca btl vader,self,... your_mpi_application
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+A requested component was not found, or was unable to be opened.  This
+means that this component is either not installed or is unable to be
+used on your system (e.g., sometimes this means that shared libraries
+that the component requires are unable to be found/loaded).  Note that
+Open MPI stopped checking at the first component that it did not find.
+
+Host:      megrez.bu.binghamton.edu
+Framework: btl
+Component: sm
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+It looks like MPI_INIT failed for some reason; your parallel process is
+likely to abort.  There are many reasons that a parallel process can
+fail during MPI_INIT; some of which are due to configuration or environment
+problems.  This failure appears to be an internal failure; here's some
+additional information (which may only be relevant to an Open MPI
+developer):
+
+  mca_bml_base_open() failed
+  --> Returned "Not found" (-13) instead of "Success" (0)
+--------------------------------------------------------------------------
+[megrez:931870] *** An error occurred in MPI_Init_thread
+[megrez:931870] *** reported by process [104464385,0]
+[megrez:931870] *** on a NULL communicator
+[megrez:931870] *** Unknown error
+[megrez:931870] *** MPI_ERRORS_ARE_FATAL (processes in this communicator will now abort,
+[megrez:931870] ***    and potentially your MPI job)
+[megrez.bu.binghamton.edu:931848] 1 more process has sent help message help-mpi-btl-sm.txt / btl sm is dead
+[megrez.bu.binghamton.edu:931848] Set MCA parameter "orte_base_help_aggregate" to 0 to see all help / error messages
+[megrez.bu.binghamton.edu:931848] 1 more process has sent help message help-mca-base.txt / find-available:not-valid
+[megrez.bu.binghamton.edu:931848] 1 more process has sent help message help-mpi-runtime.txt / mpi_init:startup:internal-failure
+[megrez.bu.binghamton.edu:931848] 1 more process has sent help message help-mpi-errors.txt / mpi_errors_are_fatal unknown handle
