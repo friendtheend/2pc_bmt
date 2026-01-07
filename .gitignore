@@ -5,3 +5,4 @@ build/
 *.dylib
 *.exe
 *.bin
+perf.data
