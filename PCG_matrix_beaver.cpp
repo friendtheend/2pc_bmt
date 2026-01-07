@@ -21,20 +21,6 @@
 //       M=256, K=128, N=256, bits=64 需要约 4GB 通信
 
 // ============================================================
-// libsodium noclamp
-// ============================================================
-#include <sodium/crypto_scalarmult_ed25519.h>
-
-extern "C" int crypto_scalarmult_noclamp(
-    unsigned char* q, const unsigned char* n, const unsigned char* p) {
-    return crypto_scalarmult_ed25519_noclamp(q, n, p);
-}
-extern "C" int crypto_scalarmult_base_noclamp(
-    unsigned char* q, const unsigned char* n) {
-    return crypto_scalarmult_ed25519_base_noclamp(q, n);
-}
-
-// ============================================================
 // Includes
 // ============================================================
 #include <cstdint>
@@ -47,21 +33,23 @@ extern "C" int crypto_scalarmult_base_noclamp(
 #include <fstream>
 #include <algorithm>
 #include <atomic>
+#include <stdexcept>
 #include <thread>
-#include <mutex>
+#include <memory>
+#include <span>
 
 #include <mpi.h>
 #include <omp.h>
 
-#include <libOTe/TwoChooseOne/Iknp/IknpOtExtSender.h>
-#include <libOTe/TwoChooseOne/Iknp/IknpOtExtReceiver.h>
-#include <coproto/Socket/Socket.h>
-#include <cryptoTools/Common/Defines.h>
-#include <cryptoTools/Crypto/PRNG.h>
-#include <macoro/sync_wait.h>
-#include <macoro/task.h>
+#include "comm/channel.h"
+#include "comm/mpi_channel.h"
+#include "common/bitvec.h"
+#include "common/types.h"
+#include "crypto/prng.h"
+#include "ot/base_ot.h"
+#include "ot/iknp.h"
 
-using namespace osuCrypto;
+using namespace otx;
 using u64 = uint64_t;
 using u32 = uint32_t;
 using u8  = uint8_t;
@@ -71,7 +59,7 @@ using u8  = uint8_t;
 // ============================================================
 static int g_k_bits = 64;
 static int g_num_channels = 4;
-static const size_t MAX_OT_PER_CALL = 900000;
+static const size_t MAX_OT_PER_CALL = 1600000;
 
 // ============================================================
 // 统计
@@ -89,6 +77,13 @@ struct Stats {
     std::atomic<double> recv_time{0};
 };
 static Stats g_stats;
+
+// 每个通道的 OT 扩展上下文
+struct OtContext {
+    std::shared_ptr<IChannel> ch;
+    IknpReceiver iknp_recv;
+    IknpSender iknp_send;
+};
 
 // ============================================================
 // ChaCha20 PRG
@@ -135,70 +130,35 @@ static inline u64 blk2u64(const block& b) {
     return lo ^ hi;
 }
 
-// ============================================================
-// MPI Socket (与你的 PCG_multibit_parallel.cpp 相同)
-// ============================================================
-class MPIChannelSocket {
-    int rank_, peer_;
-    int channel_id_;
-    int stag_, rtag_;
-    bool closed_ = false;
-    std::mutex smtx_, rmtx_;
-    std::vector<u8> rbuf_;
-    size_t rpos_ = 0;
-    
-public:
-    MPIChannelSocket(int rank, int channel_id) 
-        : rank_(rank), peer_(1-rank), channel_id_(channel_id) {
-        int base = channel_id * 1000;
-        stag_ = (rank == 0) ? (base + 100) : (base + 200);
-        rtag_ = (rank == 0) ? (base + 200) : (base + 100);
+static std::vector<u8> pack_choices16(const BitVector& bv) {
+    std::vector<u8> out(16, 0);
+    for (size_t i = 0; i < 128 && i < bv.size(); ++i) {
+        if (bv[i]) out[i >> 3] |= static_cast<u8>(1U << (i & 7));
     }
-    
-    ~MPIChannelSocket() { closed_ = true; }
-    
-    // Required by coproto Socket interface
-    void close() { closed_ = true; }
-    bool isOpen() const { return !closed_; }
+    return out;
+}
 
-    macoro::task<std::tuple<std::error_code, size_t>>
-    send(std::span<const u8> d, macoro::stop_token) {
-        if (closed_) co_return std::make_tuple(std::make_error_code(std::errc::broken_pipe), size_t(0));
-        std::lock_guard<std::mutex> lk(smtx_);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        MPI_Send((void*)d.data(), d.size(), MPI_BYTE, peer_, stag_, MPI_COMM_WORLD);
-        auto t2 = std::chrono::high_resolution_clock::now();
-        g_stats.send_time += std::chrono::duration<double>(t2 - t1).count();
-        g_stats.bytes_sent += d.size();
-        co_return std::make_tuple(std::error_code{}, d.size());
+static BitVector unpack_choices16(const std::vector<u8>& in) {
+    BitVector bv(128);
+    for (size_t i = 0; i < 128 && (i >> 3) < in.size(); ++i) {
+        bool bit = (in[i >> 3] >> (i & 7)) & 1U;
+        bv.set(i, bit);
     }
+    return bv;
+}
 
-    macoro::task<std::tuple<std::error_code, size_t>>
-    recv(std::span<u8> d, macoro::stop_token) {
-        if (closed_) co_return std::make_tuple(std::make_error_code(std::errc::broken_pipe), size_t(0));
-        if (d.empty()) co_return std::make_tuple(std::error_code{}, size_t(0));
-        
-        std::lock_guard<std::mutex> lk(rmtx_);
-        while (rpos_ >= rbuf_.size()) {
-            rbuf_.clear(); rpos_ = 0;
-            auto t1 = std::chrono::high_resolution_clock::now();
-            MPI_Status st;
-            MPI_Probe(peer_, rtag_, MPI_COMM_WORLD, &st);
-            int cnt; MPI_Get_count(&st, MPI_BYTE, &cnt);
-            rbuf_.resize(cnt);
-            MPI_Recv(rbuf_.data(), cnt, MPI_BYTE, peer_, rtag_, MPI_COMM_WORLD, &st);
-            auto t2 = std::chrono::high_resolution_clock::now();
-            g_stats.recv_time += std::chrono::duration<double>(t2 - t1).count();
-            g_stats.bytes_recv += cnt;
-        }
-        size_t n = std::min(rbuf_.size() - rpos_, d.size());
-        std::memcpy(d.data(), rbuf_.data() + rpos_, n);
-        rpos_ += n;
-        co_return std::make_tuple(std::error_code{}, n);
-    }
+// 初始化 IKNP 扩展上下文（使用公开的不安全 Base OT 生成器，仅为功能演示）
+static void init_iknp_context(int /*party*/, int ch_id, u64 ot_seed, OtContext& ctx) {
+    PRNG prng_choices(block{ot_seed ^ 0x42415345ULL, static_cast<u64>(ch_id)});
+    PRNG prng_msgs(block{ot_seed ^ 0x4D53474FULL, static_cast<u64>(ch_id)});
 
-    macoro::task<void> flush() { co_return; }
-};
+    BaseOtSenderOutput base_sender{};
+    BaseOtReceiverOutput base_receiver{};
+    insecure_base_ot_pair(base_sender, base_receiver, prng_choices, prng_msgs);
+
+    ctx.iknp_recv.setBaseOts(std::span<const std::array<block, 2>>(base_sender.msg.data(), base_sender.msg.size()));
+    ctx.iknp_send.setBaseOts(std::span<const block>(base_receiver.key.data(), base_receiver.key.size()), base_receiver.choices);
+}
 
 // ============================================================
 // 文件头 (Matrix Triple 格式)
@@ -253,7 +213,7 @@ struct MatrixHeader {
 // ============================================================
 static u64 gilboa_inner_product(
     u64 seed,
-    coproto::Socket& sock,
+    OtContext& ctx,
     int role,  // 0 = receiver (has a), 1 = sender (has b)
     const u64* a_row,  // [K] - only used if role=0
     const u64* b_col,  // [K] - only used if role=1
@@ -283,26 +243,34 @@ static u64 gilboa_inner_product(
             for (size_t i = 0; i < chunk_elems && (chunk_start_elem + i) < (size_t)K; ++i) {
                 u64 a = a_row[chunk_start_elem + i] & mask;
                 for (int b = 0; b < k && (i * k + b) < chunk_ots; ++b) {
-                    choices[i * k + b] = (a >> b) & 1ULL;
+                    choices.set(i * k + b, (a >> b) & 1ULL);
                 }
             }
             
             PRNG prng(block(chunk_seed ^ 0x67696C62ULL, 0));
-            IknpOtExtReceiver recver;
-            std::vector<block> recv(chunk_ots);
-            macoro::sync_wait(recver.receiveChosen(choices, recv, prng, sock));
-            
+            std::vector<block> pads(chunk_ots);
+            ctx.iknp_recv.receive(choices, std::span<block>(pads.data(), pads.size()), prng, ctx.ch);
+
+            auto ct_bytes = ctx.ch->recv().get();
+            if (ct_bytes.size() != chunk_ots * 2 * sizeof(block)) {
+                throw std::runtime_error("COT mask recv size mismatch");
+            }
+            std::vector<block> cts(chunk_ots * 2);
+            std::memcpy(cts.data(), ct_bytes.data(), ct_bytes.size());
+
             // 累加 - 关键改动！这里是对所有 K 个元素求和
             __uint128_t acc = 0;
             for (size_t i = 0; i < chunk_ots; ++i) {
-                acc += (__uint128_t)blk2u64(recv[i]);
+                const block& c0 = cts[2 * i];
+                const block& c1 = cts[2 * i + 1];
+                block msg = choices[i] ? (c1 ^ pads[i]) : (c0 ^ pads[i]);
+                acc += (__uint128_t)blk2u64(msg);
             }
             result = (result + (u64)acc) & mask;
             
         } else {
             // Sender: 用 b 的值构造 OT 消息
             PRNG prng(block(chunk_seed ^ 0x67696C62ULL ^ 0x5353454EULL, 0));
-            IknpOtExtSender sender;
             
             std::vector<std::array<block, 2>> msgs(chunk_ots);
             __uint128_t sum_r = 0;
@@ -317,7 +285,17 @@ static u64 gilboa_inner_product(
                 }
             }
             
-            macoro::sync_wait(sender.sendChosen(msgs, prng, sock));
+            std::vector<std::array<block, 2>> pads(chunk_ots);
+            ctx.iknp_send.send(std::span<std::array<block, 2>>(pads.data(), pads.size()), prng, ctx.ch);
+
+            std::vector<block> cts(chunk_ots * 2);
+            for (size_t i = 0; i < chunk_ots; ++i) {
+                cts[2 * i] = msgs[i][0] ^ pads[i][0];
+                cts[2 * i + 1] = msgs[i][1] ^ pads[i][1];
+            }
+            std::vector<u8> ct_bytes(cts.size() * sizeof(block));
+            std::memcpy(ct_bytes.data(), cts.data(), ct_bytes.size());
+            ctx.ch->send(ct_bytes).get();
             result = (result + (u64)(0ULL - (u64)sum_r)) & mask;
         }
         
@@ -333,72 +311,210 @@ static u64 gilboa_inner_product(
 }
 
 // ============================================================
-// 批量 Gilboa: 计算多行的 cross terms
+// 批量 Gilboa: 计算多行的 cross terms (优化版 - 批量 OT)
 //
-// 对于 cross term A_me × B_peer:
-//   party 0 作为 receiver，用 A_0 的行
-//   party 1 作为 sender，用 B_1 的列
-//
-// 输出: corrections[row_start:row_end, 0:N]
+// 核心优化: 把多个 C[i,j] 的 OT 打包成一次调用
 // ============================================================
+
+// 批量计算多个 inner products 的 cross term
+// 返回每个 inner product 的结果
+static void gilboa_batch_inner_products(
+    u64 seed_base,
+    OtContext& ctx,
+    int role,  // 0=receiver, 1=sender
+    const std::vector<const u64*>& a_rows,  // receiver 的行 (或 nullptr)
+    const std::vector<std::vector<u64>>& b_cols,  // sender 的列
+    int K,
+    u64 mask,
+    std::vector<u64>& results)  // 输出
+{
+    const int k = g_k_bits;
+    const size_t num_elements = a_rows.size();
+    const size_t ots_per_element = (size_t)K * k;
+    const size_t total_ots = num_elements * ots_per_element;
+    
+    results.resize(num_elements, 0);
+    
+    if (total_ots == 0) return;
+    
+    auto t1 = std::chrono::high_resolution_clock::now();
+    
+    if (role == 0) {
+        // Receiver: 用 a 的每个 bit 作为 choice
+        BitVector choices(total_ots);
+        for (size_t elem = 0; elem < num_elements; ++elem) {
+            const u64* a = a_rows[elem];
+            for (int i = 0; i < K; ++i) {
+                u64 ai = a[i] & mask;
+                for (int b = 0; b < k; ++b) {
+                    size_t idx = elem * ots_per_element + i * k + b;
+                    choices.set(idx, (ai >> b) & 1ULL);
+                }
+            }
+        }
+        
+        PRNG prng(block(seed_base ^ 0x67696C62ULL, 0));
+        std::vector<block> pads(total_ots);
+        ctx.iknp_recv.receive(choices, std::span<block>(pads.data(), pads.size()), prng, ctx.ch);
+
+        auto ct_bytes = ctx.ch->recv().get();
+        if (ct_bytes.size() != total_ots * 2 * sizeof(block)) {
+            throw std::runtime_error("COT mask recv size mismatch");
+        }
+        std::vector<block> cts(total_ots * 2);
+        std::memcpy(cts.data(), ct_bytes.data(), ct_bytes.size());
+
+        // 累加每个元素的结果
+        for (size_t elem = 0; elem < num_elements; ++elem) {
+            __uint128_t acc = 0;
+            size_t base = elem * ots_per_element;
+            for (size_t i = 0; i < ots_per_element; ++i) {
+                size_t idx = base + i;
+                const block& c0 = cts[2 * idx];
+                const block& c1 = cts[2 * idx + 1];
+                block msg = choices[idx] ? (c1 ^ pads[idx]) : (c0 ^ pads[idx]);
+                acc += (__uint128_t)blk2u64(msg);
+            }
+            results[elem] = (u64)acc & mask;
+        }
+        
+    } else {
+        // Sender: 用 b 的值构造 OT 消息
+        PRNG prng(block(seed_base ^ 0x67696C62ULL ^ 0x5353454EULL, 0));
+        
+        std::vector<std::array<block, 2>> msgs(total_ots);
+        std::vector<__uint128_t> sum_r(num_elements, 0);
+        
+        for (size_t elem = 0; elem < num_elements; ++elem) {
+            const auto& b = b_cols[elem];
+            for (int i = 0; i < K; ++i) {
+                u64 bi = b[i] & mask;
+                for (int bit = 0; bit < k; ++bit) {
+                    size_t idx = elem * ots_per_element + i * k + bit;
+                    u64 r = prng.get<u64>() & mask;
+                    sum_r[elem] += (__uint128_t)r;
+                    msgs[idx][0] = block(r, 0);
+                    msgs[idx][1] = block((r + (bi << bit)) & mask, 0);
+                }
+            }
+        }
+        
+        std::vector<std::array<block, 2>> pads(total_ots);
+        ctx.iknp_send.send(std::span<std::array<block, 2>>(pads.data(), pads.size()), prng, ctx.ch);
+
+        std::vector<block> cts(total_ots * 2);
+        for (size_t i = 0; i < total_ots; ++i) {
+            cts[2 * i] = msgs[i][0] ^ pads[i][0];
+            cts[2 * i + 1] = msgs[i][1] ^ pads[i][1];
+        }
+        std::vector<u8> ct_bytes(cts.size() * sizeof(block));
+        std::memcpy(ct_bytes.data(), cts.data(), ct_bytes.size());
+        ctx.ch->send(ct_bytes).get();
+        
+        for (size_t elem = 0; elem < num_elements; ++elem) {
+            results[elem] = (0ULL - (u64)sum_r[elem]) & mask;
+        }
+    }
+    
+    auto t2 = std::chrono::high_resolution_clock::now();
+    g_stats.gilboa_time += std::chrono::duration<double>(t2 - t1).count();
+    g_stats.ot_calls++;
+    g_stats.total_ots += total_ots;
+}
+
 static void gilboa_batch_rows(
     int party,
-    coproto::Socket& sock,
+    OtContext& ctx,
     u64 seed_base,
     int row_start, int row_end,  // 处理的行范围
     int /*M*/, int K, int N,
-    const std::vector<u64>& my_A,  // [M×K] - 只有 party 0 用
-    const std::vector<u64>& my_B,  // [K×N] - 只有 party 1 用
+    const std::vector<u64>& my_A,  // [M×K]
+    const std::vector<u64>& my_B,  // [K×N]
     std::vector<u64>& corrections,  // [M×N] output
     u64 mask,
-    std::atomic<int>& progress)
+    std::atomic<size_t>& progress,
+    size_t total_elements,
+    std::chrono::high_resolution_clock::time_point t_start)
 {
-    // 对于每一行 i
+    // 批处理大小 - 平衡内存和效率
+    const int BATCH_SIZE = 1024;  // 一次处理 256 个 C 元素
+    
+    // 收集所有要处理的 (i, j) 对
+    std::vector<std::pair<int, int>> work_items;
     for (int i = row_start; i < row_end; ++i) {
-        // 对于每一列 j
         for (int j = 0; j < N; ++j) {
-            size_t out_idx = (size_t)i * N + j;
-            u64 seed = seed_base + out_idx * 2;
+            work_items.emplace_back(i, j);
+        }
+    }
+    
+    // 分批处理
+    for (size_t batch_start = 0; batch_start < work_items.size(); batch_start += BATCH_SIZE) {
+        size_t batch_end = std::min(batch_start + BATCH_SIZE, work_items.size());
+        size_t batch_size = batch_end - batch_start;
+        
+        // 准备批量数据
+        std::vector<const u64*> a_rows(batch_size);
+        std::vector<std::vector<u64>> b_cols(batch_size, std::vector<u64>(K));
+        std::vector<size_t> out_indices(batch_size);
+        
+        for (size_t b = 0; b < batch_size; ++b) {
+            int i = work_items[batch_start + b].first;
+            int j = work_items[batch_start + b].second;
             
-            // Cross term 1: A_me × B_peer
-            // Party 0 is receiver (has A row), Party 1 is sender (has B col)
-            u64 cross1;
-            {
-                const u64* a_row = (party == 0) ? &my_A[i * K] : nullptr;
-                
-                // 提取 B 的第 j 列
-                std::vector<u64> b_col(K);
-                if (party == 1) {
-                    for (int kk = 0; kk < K; ++kk) {
-                        b_col[kk] = my_B[kk * N + j];
-                    }
-                }
-                
-                int role = (party == 0) ? 0 : 1;
-                cross1 = gilboa_inner_product(seed, sock, role, a_row, b_col.data(), K, mask);
+            a_rows[b] = &my_A[i * K];
+            for (int kk = 0; kk < K; ++kk) {
+                b_cols[b][kk] = my_B[kk * N + j];
             }
-            
-            // Cross term 2: A_peer × B_me
-            // Party 0 is sender (has B col), Party 1 is receiver (has A row)
-            u64 cross2;
-            {
-                const u64* a_row = (party == 1) ? &my_A[i * K] : nullptr;
-                
-                std::vector<u64> b_col(K);
-                if (party == 0) {
-                    for (int kk = 0; kk < K; ++kk) {
-                        b_col[kk] = my_B[kk * N + j];
-                    }
-                }
-                
-                int role = (party == 0) ? 1 : 0;
-                cross2 = gilboa_inner_product(seed + 1, sock, role, a_row, b_col.data(), K, mask);
-            }
-            
-            corrections[out_idx] = (cross1 + cross2) & mask;
+            out_indices[b] = (size_t)i * N + j;
         }
         
-        progress++;
+        // Cross term 1: A_me × B_peer
+        // Party 0 is receiver, Party 1 is sender
+        std::vector<u64> cross1_results;
+        {
+            u64 seed1 = seed_base + work_items[batch_start].first * N * 2 + work_items[batch_start].second * 2;
+            int role = (party == 0) ? 0 : 1;
+            
+            if (role == 0) {
+                // Receiver uses A rows
+                gilboa_batch_inner_products(seed1, ctx, 0, a_rows, b_cols, K, mask, cross1_results);
+            } else {
+                // Sender uses B cols
+                std::vector<const u64*> dummy_a(batch_size, nullptr);
+                gilboa_batch_inner_products(seed1, ctx, 1, dummy_a, b_cols, K, mask, cross1_results);
+            }
+        }
+        
+        // Cross term 2: A_peer × B_me
+        // Party 0 is sender, Party 1 is receiver
+        std::vector<u64> cross2_results;
+        {
+            u64 seed2 = seed_base + work_items[batch_start].first * N * 2 + work_items[batch_start].second * 2 + 1;
+            int role = (party == 0) ? 1 : 0;
+            
+            if (role == 0) {
+                // Receiver uses A rows
+                gilboa_batch_inner_products(seed2, ctx, 0, a_rows, b_cols, K, mask, cross2_results);
+            } else {
+                // Sender uses B cols
+                std::vector<const u64*> dummy_a(batch_size, nullptr);
+                gilboa_batch_inner_products(seed2, ctx, 1, dummy_a, b_cols, K, mask, cross2_results);
+            }
+        }
+        
+        // 写入结果
+        for (size_t b = 0; b < batch_size; ++b) {
+            corrections[out_indices[b]] = (cross1_results[b] + cross2_results[b]) & mask;
+        }
+        
+        // 更新进度
+        size_t done = progress.fetch_add(batch_size) + batch_size;
+        auto t_now = std::chrono::high_resolution_clock::now();
+        double sec = std::chrono::duration<double>(t_now - t_start).count();
+        double rate = done / sec;
+        double eta = (total_elements - done) / rate;
+        std::fprintf(stderr, "\r[Party %d] Elements: %zu/%zu (%.2f%%), %.1f/s, ETA: %.0fs    ",
+                     party, done, total_elements, 100.0 * done / total_elements, rate, eta);
     }
 }
 
@@ -484,15 +600,16 @@ static void generate_matrix_triple(
     // Step 3: 计算 cross terms via Gilboa inner products
     std::fprintf(stderr, "[Party %d] Computing cross terms via %d channels...\n", party, num_channels);
     
-    // 创建通道
-    std::vector<coproto::Socket> sockets;
+    // 创建通道并初始化 IKNP
+    std::vector<OtContext> contexts(num_channels);
     for (int ch = 0; ch < num_channels; ++ch) {
-        sockets.emplace_back(coproto::make_socket_tag{}, 
-                            std::make_unique<MPIChannelSocket>(party, ch));
+        auto channel = make_mpi_channel(MPI_COMM_WORLD, 1 - party, /*tag_base=*/ch * 1000);
+        contexts[ch].ch = std::move(channel);
+        init_iknp_context(party, ch, ot_seed, contexts[ch]);
     }
     
     std::vector<u64> corrections(nC, 0);
-    std::atomic<int> progress{0};
+    std::atomic<size_t> progress{0};
     
     // 分配行给通道
     int rows_per_channel = (M + num_channels - 1) / num_channels;
@@ -504,28 +621,14 @@ static void generate_matrix_triple(
         if (row_start >= M) break;
         
         threads.emplace_back([&, ch, row_start, row_end]() {
-            gilboa_batch_rows(party, sockets[ch], ot_seed,
+            gilboa_batch_rows(party, contexts[ch], ot_seed,
                               row_start, row_end, M, K, N,
-                              my_A, my_B, corrections, mask, progress);
+                              my_A, my_B, corrections, mask, progress, nC, t_start);
         });
     }
     
-    // 进度监控
-    std::thread monitor([&]() {
-        while (progress.load() < M) {
-            int done = progress.load();
-            auto t_now = std::chrono::high_resolution_clock::now();
-            double sec = std::chrono::duration<double>(t_now - t_start).count();
-            double eta = (done > 0) ? (M - done) * sec / done : 0;
-            std::fprintf(stderr, "\r[Party %d] Rows: %d/%d (%.1f%%), ETA: %.0fs    ",
-                         party, done, M, 100.0 * done / M, eta);
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-    });
-    
+    // 等待所有线程完成 (进度在 gilboa_batch_rows 内更新)
     for (auto& t : threads) t.join();
-    progress = M;  // 确保监控线程退出
-    monitor.join();
     
     std::fprintf(stderr, "\n");
     
@@ -667,10 +770,17 @@ static bool verify_matrix_triple(
 // ============================================================
 int main(int argc, char** argv)
 {
+    int rank = -1, size = 0;
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-    
-    int rank, size;
+    if (provided < MPI_THREAD_MULTIPLE) {
+        if (provided == MPI_THREAD_SINGLE && rank == 0) {
+            std::fprintf(stderr, "MPI threading level SINGLE; need MPI_THREAD_MULTIPLE\n");
+        } else if (rank == 0) {
+            std::fprintf(stderr, "MPI threading level insufficient: %d (need %d)\n", provided, MPI_THREAD_MULTIPLE);
+        }
+        return 1;
+    }
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     
