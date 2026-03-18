@@ -13,9 +13,26 @@
 //     PCG_matrix_beaver.cpp -o pcg_matrix \
 //     -I/usr/local/include -L/usr/local/lib \
 //     -llibOTe -lcryptoTools -lcoproto -lsodium -lpthread
-//
+
 // 运行:
 //   mpirun -np 2 ./pcg_matrix --M 256 --K 128 --N 256 --bits 64 --channels 4
+
+/*
+多线程运行：
+export OMP_NUM_THREADS=1
+unset OMP_PLACES
+unset OMP_PROC_BIND
+
+echo "$(hostname) slots=64" > hostfile
+
+mpirun -np 2 --hostfile hostfile \
+  --map-by ppr:1:socket:pe=16 --bind-to core \
+  --mca pml ob1 --mca btl vader,self \
+  ./build/pcg_matrix_beaver --M 256 --K 64 --N 256 --bits 64 \
+  --channels 20 --batch 256 --no-verify
+
+
+*/
 //
 // 注意: 对于大矩阵，通信量 = O(M×N×K×k_bits) 很大！
 //       M=256, K=128, N=256, bits=64 需要约 4GB 通信
@@ -41,6 +58,7 @@ extern "C" int crypto_scalarmult_base_noclamp(
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <vector>
 #include <random>
 #include <chrono>
@@ -133,6 +151,39 @@ static inline u64 blk2u64(const block& b) {
     std::memcpy(&lo, &b, 8);
     std::memcpy(&hi, (const u8*)&b + 8, 8);
     return lo ^ hi;
+}
+
+// AVX-512 dot product for a_row (contiguous) and b_col (strided by stride).
+// Uses low 64-bit products and wraparound sum; final masking keeps mod 2^k.
+static inline u64 dot_product_u64(const u64* a_row, const u64* b_col, int K, int stride) {
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    const int VEC = 8;
+    __m512i vacc = _mm512_setzero_si512();
+    __m512i idx_base = _mm512_set_epi64(
+        (long long)7 * stride, (long long)6 * stride, (long long)5 * stride, (long long)4 * stride,
+        (long long)3 * stride, (long long)2 * stride, (long long)1 * stride, (long long)0 * stride);
+    int k = 0;
+    for (; k + VEC <= K; k += VEC) {
+        __m512i avec = _mm512_loadu_si512((const void*)(a_row + k));
+        __m512i idx = _mm512_add_epi64(idx_base, _mm512_set1_epi64((long long)k * stride));
+        __m512i bvec = _mm512_i64gather_epi64(idx, b_col, 8);
+        __m512i prod = _mm512_mullox_epi64(avec, bvec);
+        vacc = _mm512_add_epi64(vacc, prod);
+    }
+    alignas(64) u64 buf[8];
+    _mm512_store_si512((__m512i*)buf, vacc);
+    u64 acc = buf[0] + buf[1] + buf[2] + buf[3] + buf[4] + buf[5] + buf[6] + buf[7];
+    for (; k < K; ++k) {
+        acc += a_row[k] * b_col[(size_t)k * stride];
+    }
+    return acc;
+#else
+    u64 acc = 0;
+    for (int k = 0; k < K; ++k) {
+        acc += a_row[k] * b_col[(size_t)k * stride];
+    }
+    return acc;
+#endif
 }
 
 // ============================================================
@@ -424,6 +475,98 @@ static void gilboa_batch_inner_products(
     g_stats.total_ots += total_ots;
 }
 
+// static void gilboa_batch_rows(
+//     int party,
+//     coproto::Socket& sock,
+//     u64 seed_base,
+//     int row_start, int row_end,
+//     int /*M*/, int K, int N,
+//     const std::vector<u64>& my_A,
+//     const std::vector<u64>& my_B,
+//     std::vector<u64>& corrections,
+//     u64 mask,
+//     std::atomic<size_t>& progress,
+//     size_t total_elements,
+//     std::chrono::high_resolution_clock::time_point t_start)
+// {
+//     const int BATCH_SIZE = 256;  // 改回 256
+    
+//     // ====== 不用 work_items，直接计算索引 ======
+//     const int total_work = (row_end - row_start) * N;
+    
+//     for (int work_idx = 0; work_idx < total_work; work_idx += BATCH_SIZE) {
+//         int batch_size = std::min(BATCH_SIZE, total_work - work_idx);
+        
+//         // 准备批量数据
+//         std::vector<const u64*> a_rows(batch_size);
+//         std::vector<std::vector<u64>> b_cols(batch_size, std::vector<u64>(K));
+//         std::vector<size_t> out_indices(batch_size);
+        
+//         for (int b = 0; b < batch_size; ++b) {
+//             int local_idx = work_idx + b;
+//             int i = row_start + (local_idx / N);  // 行
+//             int j = local_idx % N;                 // 列
+            
+//             a_rows[b] = &my_A[i * K];
+//             for (int kk = 0; kk < K; ++kk) {
+//                 b_cols[b][kk] = my_B[kk * N + j];
+//             }
+//             out_indices[b] = (size_t)i * N + j;
+//         }
+        
+//         // Cross term 1: A_me × B_peer
+//         std::vector<u64> cross1_results;
+//         {
+//             int local_first = work_idx;
+//             int i_first = row_start + (local_first / N);
+//             int j_first = local_first % N;
+//             u64 seed1 = seed_base + i_first * N * 2 + j_first * 2;
+//             int role = (party == 0) ? 0 : 1;
+            
+//             if (role == 0) {
+//                 gilboa_batch_inner_products(seed1, sock, 0, a_rows, b_cols, K, mask, cross1_results);
+//             } else {
+//                 std::vector<const u64*> dummy_a(batch_size, nullptr);
+//                 gilboa_batch_inner_products(seed1, sock, 1, dummy_a, b_cols, K, mask, cross1_results);
+//             }
+//         }
+        
+//         // Cross term 2: A_peer × B_me
+//         std::vector<u64> cross2_results;
+//         {
+//             int local_first = work_idx;
+//             int i_first = row_start + (local_first / N);
+//             int j_first = local_first % N;
+//             u64 seed2 = seed_base + i_first * N * 2 + j_first * 2 + 1;
+//             int role = (party == 0) ? 1 : 0;
+            
+//             if (role == 0) {
+//                 gilboa_batch_inner_products(seed2, sock, 0, a_rows, b_cols, K, mask, cross2_results);
+//             } else {
+//                 std::vector<const u64*> dummy_a(batch_size, nullptr);
+//                 gilboa_batch_inner_products(seed2, sock, 1, dummy_a, b_cols, K, mask, cross2_results);
+//             }
+//         }
+        
+//         // 写入结果
+//         for (int b = 0; b < batch_size; ++b) {
+//             corrections[out_indices[b]] = (cross1_results[b] + cross2_results[b]) & mask;
+//         }
+        
+//         // 更新进度
+//         size_t done = progress.fetch_add(batch_size) + batch_size;
+//         if (work_idx % (BATCH_SIZE * 10) == 0) {
+//             auto t_now = std::chrono::high_resolution_clock::now();
+//             double sec = std::chrono::duration<double>(t_now - t_start).count();
+//             double rate = done / sec;
+//             double eta = (total_elements - done) / rate;
+//             std::fprintf(stderr, "\r[Party %d] Elements: %zu/%zu (%.2f%%), %.1f/s, ETA: %.0fs    ",
+//                         party, done, total_elements, 100.0 * done / total_elements, rate, eta);
+//         }
+//     }
+// }
+
+
 static void gilboa_batch_rows(
     int party,
     coproto::Socket& sock,
@@ -439,7 +582,7 @@ static void gilboa_batch_rows(
     std::chrono::high_resolution_clock::time_point t_start)
 {
     // 批处理大小 - 平衡内存和效率
-    const int BATCH_SIZE = 1024;  // 一次处理 256 个 C 元素
+    const int BATCH_SIZE = 1024;  
     
     // 收集所有要处理的 (i, j) 对
     std::vector<std::pair<int, int>> work_items;
@@ -585,12 +728,11 @@ static void generate_matrix_triple(
     
     #pragma omp parallel for schedule(dynamic, 16)
     for (int i = 0; i < M; ++i) {
+        const u64* a_row = &my_A[(size_t)i * K];
         for (int j = 0; j < N; ++j) {
-            __uint128_t acc = 0;
-            for (int k = 0; k < K; ++k) {
-                acc += (__uint128_t)my_A[i * K + k] * my_B[k * N + j];
-            }
-            local_C[i * N + j] = (u64)acc & mask;
+            const u64* b_col = &my_B[j];
+            u64 acc = dot_product_u64(a_row, b_col, K, N);
+            local_C[(size_t)i * N + j] = acc & mask;
         }
     }
     
